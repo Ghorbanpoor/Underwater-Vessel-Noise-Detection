@@ -1,483 +1,456 @@
 
-import os
-import re
+"""Underwater Vessel Noise Challenge - evidence-based conservative baseline.
+
+The supplied project files contain unlabelled South African background
+measurements and descriptive EDA, but no labelled controlled-addition targets.
+Consequently this script does NOT pretend to train a supervised share model.
+
+Default leaderboard strategy:
+    share_added_vessel = 0.0
+
+The supplied deep-EDA summary records an all-zero reference score of 0.753867825.
+This is a reference from that analysis snapshot, not a guarantee of future score.
+
+score_added_vessel is a separate, heuristic acoustic-evidence diagnostic. The
+challenge documentation says this column does not affect the automatic score.
+"""
+
+from __future__ import annotations
+
 import argparse
+import re
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-warnings.filterwarnings("ignore")
-
-# ============================================================
-# Underwater Vessel Noise Challenge
-# Baseline inference pipeline
-#
-# Input:
-#   Test.csv
-#   sample_submission.csv
-#
-# Output:
-#   submission.csv
-#
-# This is an unsupervised, fixed per-window energy-excess
-# baseline. It is NOT the trained R17 ensemble.
-# ============================================================
-
-SEED = 42
 
 N_MINUTES = 15
 N_BANDS = 25
 N_FEATURES = N_MINUTES * N_BANDS
 
-BASELINE_QUANTILE = 20.0
-EXCESS_THRESHOLD_DB = 2.0
-ACTIVE_THRESHOLD_DB = 3.0
-
-FEATURE_PATTERN = re.compile(
+FEATURE_RE = re.compile(
     r"^m(?P<minute>\d+)_TOL_(?P<frequency>\d+(?:\.\d+)?)$",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
 
-def find_feature_columns(df):
-    """
-    Detect and sort acoustic columns by minute and frequency.
-    """
-    features = []
+def get_feature_columns(frame: pd.DataFrame) -> list[str]:
+    """Return acoustic columns ordered by minute, then band frequency."""
+    found = []
 
-    for col in df.columns:
-        match = FEATURE_PATTERN.match(str(col).strip())
+    for col in frame.columns:
+        match = FEATURE_RE.match(str(col).strip())
 
         if match:
-            minute = int(match.group("minute"))
-            frequency = float(match.group("frequency"))
+            found.append((
+                int(match.group("minute")),
+                float(match.group("frequency")),
+                str(col)
+            ))
 
-            features.append(
-                (minute, frequency, col)
-            )
+    found.sort(key=lambda item: (item[0], item[1]))
 
-    features.sort(
-        key=lambda item: (item[0], item[1])
+    if len(found) != N_FEATURES:
+        raise ValueError(
+            f"Expected {N_FEATURES} acoustic columns; found {len(found)}."
+        )
+
+    minutes = sorted({item[0] for item in found})
+    frequencies = sorted({item[1] for item in found})
+
+    if len(minutes) != N_MINUTES or len(frequencies) != N_BANDS:
+        raise ValueError(
+            f"Unexpected layout: {len(minutes)} minutes and "
+            f"{len(frequencies)} frequency bands."
+        )
+
+    return [item[2] for item in found]
+
+
+def sigmoid(value: float) -> float:
+    value = float(np.clip(value, -30.0, 30.0))
+    return 1.0 / (1.0 + np.exp(-value))
+
+
+def safe_nanmedian(values: np.ndarray, axis: int) -> np.ndarray:
+    """Nanmedian without noisy all-NaN runtime warnings."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.nanmedian(values, axis=axis)
+
+
+def acoustic_evidence_score(
+    window: np.ndarray,
+    frequencies: np.ndarray
+) -> tuple[float, dict]:
+    """Calculate a heuristic evidence score; not a calibrated probability."""
+
+    x = np.asarray(window, dtype=np.float64).reshape(
+        N_MINUTES, N_BANDS
     )
-
-    if len(features) != N_FEATURES:
-        raise ValueError(
-            f"Expected {N_FEATURES} acoustic columns, "
-            f"but found {len(features)}."
-        )
-
-    minutes = sorted(set(x[0] for x in features))
-    frequencies = sorted(set(x[1] for x in features))
-
-    if len(minutes) != N_MINUTES:
-        raise ValueError(
-            f"Expected {N_MINUTES} minute positions, "
-            f"found {len(minutes)}."
-        )
-
-    if len(frequencies) != N_BANDS:
-        raise ValueError(
-            f"Expected {N_BANDS} frequency bands, "
-            f"found {len(frequencies)}."
-        )
-
-    return [x[2] for x in features]
-
-
-def sigmoid(x):
-    """
-    Numerically stable sigmoid.
-    """
-    x = np.clip(x, -30.0, 30.0)
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def predict_one_window(values):
-    """
-    Estimate the added-energy fraction using a robust
-    within-window baseline for each frequency band.
-
-    Missing cells are excluded from all energy sums.
-    """
-
-    x = np.asarray(
-        values,
-        dtype=np.float64
-    ).reshape(N_MINUTES, N_BANDS)
 
     valid = np.isfinite(x)
 
     if not valid.any():
-        return 0.0, 0.0
+        return 0.0, {
+            "observed_minutes": 0,
+            "low_peak_residual_db": 0.0,
+            "low_active_fraction": 0.0,
+            "active_band_fraction": 0.0,
+        }
 
-    # A common offset is removed for numerical stability.
-    row_max = np.nanmax(x)
-
-    # Convert dB values into relative linear energy.
-    # The common scale factor cancels in the final ratio.
-    energy = np.zeros_like(x, dtype=np.float64)
-
-    energy[valid] = 10.0 ** (
-        (x[valid] - row_max) / 10.0
+    # Robust reference level for each frequency band.
+    band_reference = safe_nanmedian(
+        np.where(valid, x, np.nan),
+        axis=0
     )
 
-    # Estimate the background level independently
-    # for each frequency band.
-    baseline_db = np.full(
-        N_BANDS,
-        np.nan,
-        dtype=np.float64
+    residual = x - band_reference[np.newaxis, :]
+    residual[~valid] = np.nan
+
+    # Low-frequency bands up to 500 Hz.
+    low_bands = frequencies <= 500.0
+
+    if not low_bands.any():
+        raise ValueError(
+            "No frequency bands at or below 500 Hz were found."
+        )
+
+    low_residual = residual[:, low_bands]
+
+    minute_low_level = safe_nanmedian(
+        low_residual,
+        axis=1
     )
 
-    for band in range(N_BANDS):
+    minute_low_level = minute_low_level[
+        np.isfinite(minute_low_level)
+    ]
 
-        band_values = x[:, band]
-        observed = band_values[np.isfinite(band_values)]
-
-        if observed.size > 0:
-            baseline_db[band] = np.percentile(
-                observed,
-                BASELINE_QUANTILE
-            )
-
-    baseline_energy = np.zeros(
-        N_BANDS,
-        dtype=np.float64
-    )
-
-    band_valid = np.isfinite(baseline_db)
-
-    baseline_energy[band_valid] = 10.0 ** (
-        (baseline_db[band_valid] - row_max) / 10.0
-    )
-
-    # Apply a fixed dB excess threshold.
-    threshold_energy = (
-        baseline_energy *
-        (10.0 ** (EXCESS_THRESHOLD_DB / 10.0))
-    )
-
-    # Broadcast the frequency-specific baseline over time.
-    excess = np.maximum(
-        energy - threshold_energy[np.newaxis, :],
-        0.0
-    )
-
-    excess[~valid] = 0.0
-
-    total_energy = energy[valid].sum()
-    added_energy = excess.sum()
-
-    if total_energy <= 0.0:
-        share = 0.0
+    if minute_low_level.size:
+        low_peak = float(np.nanmax(minute_low_level))
     else:
-        share = added_energy / total_energy
+        low_peak = 0.0
 
-    share = float(
-        np.clip(share, 0.0, 1.0)
+    low_valid = valid[:, low_bands]
+
+    low_active = low_valid & (
+        np.nan_to_num(low_residual, nan=-1e6) >= 5.0
     )
 
-    # --------------------------------------------------------
-    # Independent continuous evidence score.
-    # This is a heuristic diagnostic score, not a calibrated
-    # probability and not used in the leaderboard RMSE.
-    # --------------------------------------------------------
+    low_active_fraction = float(
+        low_active.sum() / max(int(low_valid.sum()), 1)
+    )
 
-    residual_db = np.zeros_like(x)
+    band_active = np.any(
+        valid & (
+            np.nan_to_num(residual, nan=-1e6) >= 5.0
+        ),
+        axis=0
+    )
 
-    for band in range(N_BANDS):
-        if np.isfinite(baseline_db[band]):
-            band_mask = valid[:, band]
+    active_band_fraction = float(band_active.mean())
 
-            residual_db[band_mask, band] = (
-                x[band_mask, band] - baseline_db[band]
+    # Broad-band temporal change.
+    all_minute_residual = safe_nanmedian(
+        residual,
+        axis=1
+    )
+
+    all_minute_residual = all_minute_residual[
+        np.isfinite(all_minute_residual)
+    ]
+
+    if all_minute_residual.size >= 2:
+        temporal_step = float(
+            np.nanmedian(
+                np.abs(np.diff(all_minute_residual))
             )
-
-    active = (
-        valid &
-        (residual_db >= ACTIVE_THRESHOLD_DB)
-    )
-
-    active_fraction = (
-        active.sum() / max(valid.sum(), 1)
-    )
-
-    active_band_count = np.sum(
-        np.any(active, axis=0)
-    )
-
-    active_band_fraction = (
-        active_band_count / N_BANDS
-    )
-
-    if active.any():
-        mean_excess_db = np.mean(
-            residual_db[active] - ACTIVE_THRESHOLD_DB
         )
     else:
-        mean_excess_db = 0.0
+        temporal_step = 0.0
 
+    # Acoustic evidence components.
     strength = sigmoid(
-        (mean_excess_db - 2.0) / 2.0
+        (low_peak - 4.0) / 2.5
     )
 
-    temporal_evidence = np.sqrt(
-        np.clip(active_fraction / 0.15, 0.0, 1.0)
+    temporal_support = np.sqrt(
+        np.clip(low_active_fraction / 0.20, 0.0, 1.0)
     )
 
-    spectral_evidence = np.sqrt(
+    spectral_support = np.sqrt(
         np.clip(active_band_fraction / 0.25, 0.0, 1.0)
     )
 
-    score = (
-        strength *
-        temporal_evidence *
-        spectral_evidence
+    dynamics_support = (
+        0.75
+        + 0.25 * sigmoid(
+            (temporal_step - 1.5) / 1.5
+        )
     )
 
-    score = float(
-        np.clip(score, 0.0, 1.0)
-    )
+    score = float(np.clip(
+        strength
+        * temporal_support
+        * spectral_support
+        * dynamics_support,
+        0.0,
+        1.0
+    ))
 
-    return share, score
+    diagnostics = {
+        "observed_minutes": int(valid.any(axis=1).sum()),
+        "low_peak_residual_db": low_peak,
+        "low_active_fraction": low_active_fraction,
+        "active_band_fraction": active_band_fraction,
+        "median_broadband_step_db": temporal_step,
+    }
+
+    return score, diagnostics
 
 
-def run_pipeline(test_path, sample_path, output_path):
+def build_submission(
+    test_path: Path,
+    sample_path: Path,
+    output_path: Path,
+    diagnostics_path: Path
+) -> pd.DataFrame:
 
-    print("=" * 60)
+    print("=" * 64)
     print("UNDERWATER VESSEL NOISE CHALLENGE")
-    print("Baseline inference pipeline")
-    print("=" * 60)
+    print("Conservative share baseline + acoustic evidence diagnostic")
+    print("=" * 64)
 
-    # --------------------------------------------------------
-    # Load data
-    # --------------------------------------------------------
+    test = pd.read_csv(
+        test_path,
+        dtype={"ID": str}
+    )
 
-    print("\n[1/5] Loading Test.csv ...")
+    sample = pd.read_csv(
+        sample_path,
+        dtype={"ID": str}
+    )
 
-    test = pd.read_csv(test_path)
-
-    sample = pd.read_csv(sample_path)
-
-    if "ID" not in test.columns:
-        raise ValueError("Test.csv must contain an ID column.")
-
-    required_sample_columns = [
+    required = [
         "ID",
         "share_added_vessel",
         "score_added_vessel"
     ]
 
-    for col in required_sample_columns:
-        if col not in sample.columns:
-            raise ValueError(
-                f"Missing required column in sample submission: {col}"
-            )
+    if "ID" not in test.columns:
+        raise ValueError(
+            "Test.csv must contain an ID column."
+        )
+
+    if sample.columns.tolist() != required:
+        raise ValueError(
+            f"Sample submission columns must be exactly: {required}"
+        )
+
+    if test["ID"].isna().any() or sample["ID"].isna().any():
+        raise ValueError("Missing IDs were found.")
 
     if test["ID"].duplicated().any():
-        raise ValueError("Duplicate IDs found in Test.csv.")
+        raise ValueError("Duplicate IDs were found in Test.csv.")
 
     if sample["ID"].duplicated().any():
-        raise ValueError("Duplicate IDs found in sample submission.")
-
-    if len(test) != 1500:
-        print(
-            f"Warning: expected 1500 test rows, "
-            f"found {len(test)}."
+        raise ValueError(
+            "Duplicate IDs were found in sample submission."
         )
 
-    # --------------------------------------------------------
-    # Validate acoustic columns
-    # --------------------------------------------------------
+    if set(test["ID"]) != set(sample["ID"]):
+        raise ValueError(
+            "Test IDs and sample-submission IDs do not match."
+        )
 
-    print("\n[2/5] Checking acoustic features ...")
+    feature_columns = get_feature_columns(test)
 
-    feature_columns = find_feature_columns(test)
+    frequencies = np.array([
+        float(
+            FEATURE_RE.match(c).group("frequency")
+        )
+        for c in feature_columns
+    ], dtype=np.float64).reshape(
+        N_MINUTES, N_BANDS
+    )[0]
 
-    print("Number of acoustic features:", len(feature_columns))
-
-    X = test[feature_columns].apply(
+    values = test[feature_columns].apply(
         pd.to_numeric,
         errors="coerce"
-    ).to_numpy(dtype=np.float64)
-
-    X = X.reshape(
-        len(test),
-        N_MINUTES,
-        N_BANDS
     )
 
-    missing_ratio = np.isnan(X).mean()
+    data = values.to_numpy(
+        dtype=np.float64
+    ).reshape(
+        -1, N_MINUTES, N_BANDS
+    )
 
+    print(f"Rows: {len(test):,}")
+    print(f"Acoustic shape: {data.shape}")
     print(
-        f"Missing measurement ratio: "
-        f"{missing_ratio:.4%}"
+        f"Missing-cell ratio: {np.isnan(data).mean():.3%}"
     )
 
-    # --------------------------------------------------------
-    # Inference
-    # --------------------------------------------------------
+    print("Generating acoustic evidence scores ...")
 
-    print("\n[3/5] Generating predictions ...")
-
-    predictions = []
-
-    for i in range(len(test)):
-
-        share, score = predict_one_window(X[i])
-
-        predictions.append(
-            (share, score)
-        )
-
-        if (i + 1) % 100 == 0:
-            print(
-                f"Processed {i + 1}/{len(test)} windows"
-            )
-
-    predictions = np.asarray(
-        predictions,
+    scores = np.zeros(
+        len(test),
         dtype=np.float64
     )
 
-    # --------------------------------------------------------
-    # Create prediction dataframe
-    # --------------------------------------------------------
+    diagnostic_rows = []
 
-    pred_df = pd.DataFrame({
-        "ID": test["ID"].values,
-        "share_added_vessel": predictions[:, 0],
-        "score_added_vessel": predictions[:, 1]
+    for i, window in enumerate(data):
+
+        scores[i], diagnostic = acoustic_evidence_score(
+            window,
+            frequencies
+        )
+
+        diagnostic_rows.append({
+            "ID": test.iloc[i]["ID"],
+            **diagnostic
+        })
+
+        if (i + 1) % 250 == 0 or i + 1 == len(test):
+            print(
+                f"Processed {i + 1:,}/{len(test):,}"
+            )
+
+    # No labelled controlled-addition targets are included
+    # in the supplied archive. Therefore, use the all-zero
+    # reference baseline instead of inventing model predictions.
+
+    predictions = pd.DataFrame({
+        "ID": test["ID"].to_numpy(),
+        "share_added_vessel": np.zeros(
+            len(test),
+            dtype=np.float64
+        ),
+        "score_added_vessel": scores,
     })
 
-    # Preserve the exact ID order of sample submission.
+    # Preserve the exact sample-submission ID order.
     submission = sample[["ID"]].merge(
-        pred_df,
+        predictions,
         on="ID",
         how="left",
         validate="one_to_one"
     )
 
-    # Fail rather than silently submit missing predictions.
-    if submission[
-        ["share_added_vessel", "score_added_vessel"]
-    ].isna().any().any():
-
+    if submission[required[1:]].isna().any().any():
         raise ValueError(
-            "Some sample submission IDs have no predictions. "
-            "Check the IDs in Test.csv and sample submission."
+            "One or more IDs did not receive predictions."
         )
 
-    # Ensure finite values and valid ranges.
-    for col in [
-        "share_added_vessel",
-        "score_added_vessel"
-    ]:
+    for column in required[1:]:
 
-        values = submission[col].to_numpy()
+        arr = submission[column].to_numpy(
+            dtype=np.float64
+        )
 
-        if not np.isfinite(values).all():
+        if not np.isfinite(arr).all():
             raise ValueError(
-                f"Non-finite values found in {col}."
+                f"Non-finite predictions in {column}."
             )
 
-        submission[col] = np.clip(
-            values,
+        submission[column] = np.clip(
+            arr,
             0.0,
             1.0
         )
 
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
-
-    print("\n[4/5] Saving submission ...")
-
-    os.makedirs(
-        os.path.dirname(output_path) or ".",
+    output_path.parent.mkdir(
+        parents=True,
         exist_ok=True
     )
 
-    submission = submission[
-        required_sample_columns
-    ]
+    diagnostics_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-    submission.to_csv(
+    submission[required].to_csv(
         output_path,
         index=False,
         float_format="%.10f"
     )
 
-    # --------------------------------------------------------
-    # Report
-    # --------------------------------------------------------
+    pd.DataFrame(diagnostic_rows).to_csv(
+        diagnostics_path,
+        index=False
+    )
 
-    print("\n[5/5] Submission validation")
-
-    print("Number of predictions:", len(submission))
+    print("\nSubmission validation")
+    print(f"Rows: {len(submission):,}")
 
     print(
-        "Mean share prediction:",
-        round(submission["share_added_vessel"].mean(), 6)
+        f"Mean share: "
+        f"{submission['share_added_vessel'].mean():.6f}"
     )
 
     print(
-        "Mean evidence score:",
-        round(submission["score_added_vessel"].mean(), 6)
+        f"Mean evidence score: "
+        f"{submission['score_added_vessel'].mean():.6f}"
     )
+
+    print(f"Saved submission: {output_path}")
+    print(f"Saved diagnostics: {diagnostics_path}")
 
     print(
-        "Share range:",
-        submission["share_added_vessel"].min(),
-        "to",
-        submission["share_added_vessel"].max()
+        "NOTE: score_added_vessel is a heuristic diagnostic, "
+        "not a calibrated probability."
     )
 
-    print(
-        "Score range:",
-        submission["score_added_vessel"].min(),
-        "to",
-        submission["score_added_vessel"].max()
-    )
-
-    print("\nSubmission saved successfully:")
-    print(output_path)
-
-    print("\nFirst five rows:")
-    print(submission.head())
-
-    print("\nPipeline completed.")
+    return submission
 
 
-if __name__ == "__main__":
+def main():
 
     parser = argparse.ArgumentParser(
-        description="Underwater Vessel Noise baseline inference"
+        description=(
+            "Create a conservative underwater "
+            "vessel-noise submission."
+        )
     )
 
     parser.add_argument(
         "--test",
-        default="data/Test.csv",
-        help="Path to Test.csv"
+        type=Path,
+        default=Path("data/Test.csv")
     )
 
     parser.add_argument(
         "--sample",
-        default="data/sample_submission.csv",
-        help="Path to sample_submission.csv"
+        type=Path,
+        default=Path("data/sample_submission.csv")
     )
 
     parser.add_argument(
         "--output",
-        default="output/submission.csv",
-        help="Output submission path"
+        type=Path,
+        default=Path("output/submission.csv")
+    )
+
+    parser.add_argument(
+        "--diagnostics",
+        type=Path,
+        default=Path(
+            "output/prediction_diagnostics.csv"
+        )
     )
 
     args = parser.parse_args()
 
-    run_pipeline(
-        test_path=args.test,
-        sample_path=args.sample,
-        output_path=args.output
+    build_submission(
+        args.test,
+        args.sample,
+        args.output,
+        args.diagnostics
     )
+
+
+if __name__ == "__main__":
+    main()
